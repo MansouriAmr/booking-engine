@@ -2,7 +2,8 @@
 
 // 1. Swap with your live Render backend URL once deployed
 // Example: 'https://my-booking-backend.onrender.com/api/webhook'
-const CRM_WEBHOOK_URL = 'http://127.0.0.1:8000/api/webhook'; 
+// my-app/src/api/crmConnector.js
+const CRM_WEBHOOK_URL = 'https://booking-engine-4caw.onrender.com/api/webhook';
 
 // 2. Initial data loader for the UI
 export async function fetchAppointments() {
