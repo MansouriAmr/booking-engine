@@ -1,13 +1,16 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+import os
+import sqlite3
+import time
 from typing import Optional, Union
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
 import uvicorn
-import re
 
-app = FastAPI(title="Booking Automation Engine")
+app = FastAPI(title="WhatsApp Automation SaaS Engine")
 
-# Enable CORS for all origins (Netlify, Vercel, Localhost)
+# CORS Setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,83 +19,150 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Helper function to sanitize phone numbers
-def clean_phone_number(phone: str) -> str:
-    cleaned = re.sub(r"\D", "", phone) # Strip spaces, dashes, +, etc.
-    if len(cleaned) == 8: # Local Tunisian 8-digit format
-        return f"+216{cleaned}"
-    return f"+{cleaned}" if not cleaned.startswith("+") else cleaned
+# Persistent DB path (works locally and on Render persistent disk)
+DB_PATH = os.getenv("DB_PATH", "clinic_demo.db")
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# Registered Clients (Map API Key -> Client ID)
+# When you onboard a new client, add their key here or in your DB
+VALID_CLIENT_KEYS = {
+    "wa_live_demo123": "demo_clinic",
+    "wa_live_hannibal99": "clinique_hannibal",
+    os.getenv("MASTER_API_KEY", "wa_live_master_key"): "admin"
+}
 
-# Payload Structure (Tolerates messy React input)
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS appointments (
+            id TEXT PRIMARY KEY,
+            client_id TEXT DEFAULT 'default',
+            client_name TEXT,
+            phone TEXT,
+            service TEXT,
+            date TEXT,
+            time TEXT,
+            visits_count INTEGER,
+            has_reviewed INTEGER,
+            status TEXT,
+            created_at INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+async def verify_api_key(api_key: str = Security(API_KEY_HEADER)):
+    if api_key in VALID_CLIENT_KEYS or os.getenv("ENVIRONMENT") == "development":
+        return VALID_CLIENT_KEYS.get(api_key, "demo_clinic")
+    raise HTTPException(status_code=401, detail="Invalid or missing X-API-Key header")
+
 class BookingPayload(BaseModel):
     event: Optional[str] = "NEW_BOOKING"
     appointment_id: Optional[Union[str, int]] = None
     client_name: Optional[str] = "Valued Client"
     phone: str
-    service: Optional[str] = "Service"
+    service: Optional[str] = "Consultation"
     date: Optional[str] = "Today"
     time: Optional[str] = "As Scheduled"
     visits_count: Optional[Union[int, str]] = 1
     has_reviewed: Optional[bool] = False
-    auto_trigger_review: Optional[bool] = False
 
+# Function where you hook up your WhatsApp provider/bot
+def send_whatsapp_reminder(phone: str, name: str, date: str, time_slot: str):
+    print(f"📱 [WHATSAPP DISPATCHED] -> To: {name} ({phone}) for {date} at {time_slot}")
+    return True
 
-# Background Worker Functions
-def send_whatsapp_message(phone: str, message: str):
-    formatted_phone = clean_phone_number(phone)
-    print(f"[WHATSAPP OUTBOUND] Destination: {formatted_phone} | Content: '{message}'")
-    # API hook (e.g. GreenAPI / UltraMsg / Twilio) goes here
-
-
-def process_review_flow(phone: str, name: str):
-    review_link = "https://g.page/r/your-google-business-id/review"
-    msg = f"Hi {name}! Thanks for visiting us today. Could you leave us a quick review? {review_link}"
-    send_whatsapp_message(phone, msg)
-
-
-# Health-Check Endpoint for Render Pings
 @app.get("/")
 async def health_check():
-    return {"status": "online", "system": "Booking Engine Active"}
+    return {"status": "online", "system": "WhatsApp Automation API"}
 
+# Endpoint for client dashboard to fetch their own appointments
+@app.get("/api/appointments")
+async def get_appointments(client_id: str = Depends(verify_api_key)):
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, client_name, phone, service, date, time, visits_count, has_reviewed, status FROM appointments WHERE client_id = ? ORDER BY created_at DESC",
+            (client_id,)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [
+            {
+                "id": str(r["id"]),
+                "client_name": r["client_name"] or "Unknown",
+                "phone": r["phone"] or "",
+                "service": r["service"] or "Consultation",
+                "date": r["date"] or "Today",
+                "time": r["time"] or "10:00 AM",
+                "visits_count": int(r["visits_count"]) if r["visits_count"] is not None else 1,
+                "has_reviewed": bool(r["has_reviewed"]),
+                "status": r["status"] or "Scheduled"
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"Error fetching appointments: {e}")
+        return []
 
-# Main Webhook Endpoint
+# Webhook endpoint where external forms drop data
 @app.post("/api/webhook")
-async def handle_webhook(data: BookingPayload, background_tasks: BackgroundTasks):
-    
-    # 1. ROUTE: New Booking
-    if data.event == "NEW_BOOKING" or not data.event:
-        print(f"[BOOKING RECEIVED] Client: {data.client_name} ({data.phone}) | Service: {data.service}")
-        
-        conf_msg = f"Hi {data.client_name}, your appointment for {data.service} on {data.date} at {data.time} is confirmed!"
-        background_tasks.add_task(send_whatsapp_message, data.phone, conf_msg)
-        
-        return {
-            "status": "success", 
-            "event": "NEW_BOOKING",
-            "message": f"Booking logged for {data.client_name}"
-        }
+async def handle_webhook(data: BookingPayload, client_id: str = Depends(verify_api_key)):
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
 
-    # 2. ROUTE: Job Completed
-    elif data.event == "JOB_COMPLETED":
-        print(f"[JOB COMPLETED] Client: {data.client_name} | Visit Count: {data.visits_count}")
+        appt_id = str(data.appointment_id) if data.appointment_id else str(int(time.time() * 1000))
+        visits = int(data.visits_count) if data.visits_count is not None else 1
+        reviewed_int = 1 if data.has_reviewed else 0
 
-        if data.auto_trigger_review and not data.has_reviewed:
-            print(f"[REVIEW QUEUED] Sending link to {data.phone}")
-            background_tasks.add_task(process_review_flow, data.phone, data.client_name or "Valued Client")
-            msg = "Job done & review link dispatched."
-        else:
-            print(f"[REVIEW SKIPPED] {data.phone} opted out or already reviewed.")
-            msg = "Job done logged (review skipped)."
+        if data.event == "NEW_BOOKING" or not data.event:
+            cursor.execute("""
+                INSERT OR REPLACE INTO appointments 
+                (id, client_id, client_name, phone, service, date, time, visits_count, has_reviewed, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                appt_id, client_id, data.client_name, data.phone, data.service,
+                data.date, data.time, visits, reviewed_int, "Scheduled", int(time.time())
+            ))
+            conn.commit()
+            conn.close()
+            
+            # Fire the WhatsApp message trigger
+            send_whatsapp_reminder(data.phone, data.client_name, data.date, data.time)
 
-        return {
-            "status": "success", 
-            "event": "JOB_COMPLETED",
-            "message": msg
-        }
+            return {
+                "status": "success", 
+                "message": f"Appointment saved & WhatsApp queued for {data.client_name}",
+                "appointment_id": appt_id
+            }
 
-    raise HTTPException(status_code=400, detail="Invalid event type provided.")
+        elif data.event == "JOB_COMPLETED":
+            cursor.execute("""
+                UPDATE appointments 
+                SET status = 'Completed', visits_count = visits_count + 1 
+                WHERE (id = ? OR phone = ?) AND client_id = ?
+            """, (appt_id, data.phone, client_id))
+            conn.commit()
+            conn.close()
+            return {"status": "success", "message": "Updated status to Completed"}
+
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Webhook Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
