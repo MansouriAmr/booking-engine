@@ -1,0 +1,9 @@
+node_modules/
+my-app/node_modules/
+wa-gateway/node_modules/
+.env
+my-app/.env
+auth_info_baileys/
+auth_*/
+.vscode/
+.DS_Store

@@ -1,77 +1,94 @@
-import React from 'react';
-import { CheckCircle2, Check } from 'lucide-react';
+import React, { useState } from 'react';
+import { CheckCircle2, Check, Loader2 } from 'lucide-react';
 import { markJobCompleted } from '../../api/crmConnector';
 
-export default function AppointmentsView({ appointments, setAppointments, darkMode }) {
+export default function AppointmentsView({ appointments = [], setAppointments, darkMode, t = {} }) {
+  const [loadingId, setLoadingId] = useState(null);
 
   const handleJobDone = async (item) => {
-    const updatedVisits = (item.visits_count || 0) + 1;
+    if (!item?.id) return;
+    setLoadingId(item.id);
 
-    // 1. Instant local UI update (Visits go up, status changes to Completed)
+    // Optimistic UI update
     setAppointments((prev) =>
-      prev.map((app) =>
-        app.id === item.id
-          ? {
-              ...app,
-              status: 'Completed',
-              visits_count: updatedVisits,
-              review_status: app.has_reviewed ? 'Already Reviewed' : 'Review Triggered'
-            }
-          : app
-      )
+      prev.map((app) => (app.id === item.id ? { ...app, status: 'Completed' } : app))
     );
 
-    // 2. Background webhook trigger (updates CRM + sends WhatsApp review link)
-    await markJobCompleted(item);
+    const result = await markJobCompleted(item);
+    if (!result || !result.success) {
+      setAppointments((prev) => prev.map((app) => (app.id === item.id ? item : app)));
+      alert(t.dbError || 'Failed to update status in database.');
+    }
+    setLoadingId(null);
   };
+
+  if (!appointments.length) {
+    return (
+      <div className={`p-8 text-center rounded-xl border border-dashed ${
+        darkMode ? 'border-slate-700 text-slate-400' : 'border-slate-200 text-slate-500'
+      }`}>
+        {t.noAppointments || t.noAppointmentsFound || 'Aucun rendez-vous trouvé.'}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-3">
-      {appointments.map((item) => (
-        <div
-          key={item.id}
-          className={`flex items-center justify-between p-4 rounded-xl ${
-            darkMode ? 'bg-slate-800 text-slate-100' : 'bg-white text-slate-800'
-          } shadow-sm border border-slate-100/10`}
-        >
-          {/* Client & Service Info */}
-          <div>
-            <div className="flex items-center gap-2">
-              <p className="font-semibold text-base">{item.client_name}</p>
-              {/* Badge showing visit count */}
-              <span className="px-2 py-0.5 text-xs font-bold text-blue-600 bg-blue-50 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">
-                {item.visits_count || 1} {item.visits_count === 1 ? 'visit' : 'visits'}
+      {appointments.map((item) => {
+        const isProcessing = loadingId === item.id;
+        const apptTime = item.appointment_time || item.time;
+        const apptDate = item.appointment_date || item.date;
+
+        // Dynamic status text resolution
+        const isCompleted = item.status === 'Completed' || item.status === 'Terminé';
+        const displayStatus = isCompleted 
+          ? (t.completed || 'Terminé') 
+          : (t.scheduled || 'Programmé');
+
+        return (
+          <div
+            key={item.id || Math.random()}
+            className={`flex items-center justify-between p-4 rounded-xl ${
+              darkMode ? 'bg-slate-800 text-slate-100' : 'bg-white text-slate-800'
+            } shadow-sm border border-slate-100/10 transition-all`}
+          >
+            {/* Left Info Section */}
+            <div className="flex flex-col">
+              <span className="font-bold text-base text-slate-900 dark:text-slate-100">
+                {item.client_name || t.unnamedClient || 'Client sans nom'}
+              </span>
+
+              <span className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                {item.service || 'Consultation'} • {item.phone || t.noPhone || 'Pas de numéro'}
+                {apptDate ? ` • ${apptDate}` : ''}
+                {apptTime ? ` • ${apptTime}` : ''}
               </span>
             </div>
-            <p className="text-sm opacity-60 mt-0.5">
-              {item.service} • {item.phone}
-            </p>
-          </div>
 
-          {/* Action Area */}
-          <div className="flex items-center gap-3">
-            {item.status !== 'Completed' ? (
-              <button
-                onClick={() => handleJobDone(item)}
-                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 transition shadow-sm active:scale-95"
-              >
-                <CheckCircle2 size={15} /> Job Done
-              </button>
-            ) : (
-              <div className="flex items-center gap-2">
-                <span className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 dark:text-emerald-400 rounded-lg">
-                  <Check size={14} /> Completed
+            {/* Right Action Section: Status Badge Only */}
+            <div className="flex items-center gap-2 shrink-0">
+              {!isCompleted ? (
+                <button
+                  onClick={() => handleJobDone(item)}
+                  disabled={isProcessing}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-600 bg-blue-50 dark:bg-blue-900/30 dark:text-blue-300 rounded-full hover:bg-blue-100 transition disabled:opacity-50"
+                >
+                  {isProcessing ? (
+                    <Loader2 size={13} className="animate-spin" />
+                  ) : (
+                    <CheckCircle2 size={13} />
+                  )}
+                  {displayStatus}
+                </button>
+              ) : (
+                <span className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-emerald-600 bg-emerald-50 dark:bg-emerald-950/40 dark:text-emerald-400 rounded-full">
+                  <Check size={13} /> {displayStatus}
                 </span>
-                
-                {/* Background status tag so owner knows what happened */}
-                <span className="text-[11px] opacity-50 italic">
-                  {item.has_reviewed ? '• Review on file' : '• Review request sent'}
-                </span>
-              </div>
-            )}
+              )}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
