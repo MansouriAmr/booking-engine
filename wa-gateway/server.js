@@ -1,7 +1,6 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const express = require('express');
 const axios = require('axios');
-const qrcode = require('qrcode-terminal');
 const rateLimit = require('express-rate-limit');
 const cors = require('cors');
 
@@ -17,8 +16,11 @@ const RENDER_URL = process.env.RENDER_URL || `http://localhost:${PORT}`;
 const API_KEY = process.env.API_KEY || 'your-secret-api-key';
 // Enables isolated session folders per client via env vars
 const SESSION_FOLDER = process.env.SESSION_FOLDER || 'auth_info_baileys';
+// Phone number to pair (e.g. "21612345678" or "+216 12 345 678")
+const PAIRING_NUMBER = process.env.PAIRING_NUMBER;
 
 let sock;
+let activePairingCode = null;
 
 // Simple message queue to prevent sending messages simultaneously (Anti-Ban)
 const sendQueue = [];
@@ -57,18 +59,13 @@ async function connectToWhatsApp() {
 
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true
+        printQRInTerminal: false // Disabled QR code generation
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            console.log('⚡ Scan this QR Code to authenticate WhatsApp:');
-            qrcode.generate(qr, { small: true });
-        }
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect } = update;
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -81,9 +78,29 @@ async function connectToWhatsApp() {
                 console.error(`❌ Logged out from WhatsApp. Clear ${SESSION_FOLDER} folder and restart.`);
             }
         } else if (connection === 'open') {
+            activePairingCode = null; // Clear code on successful connection
             console.log(`✅ WhatsApp Baileys Gateway connected successfully! [Session: ${SESSION_FOLDER}]`);
         }
     });
+
+    // --- PAIRING CODE LOGIC ---
+    if (!sock.authState.creds.registered && PAIRING_NUMBER) {
+        setTimeout(async () => {
+            try {
+                const cleanNumber = PAIRING_NUMBER.toString().replace(/[^0-9]/g, '');
+                const code = await sock.requestPairingCode(cleanNumber);
+                
+                // Formats code as ABCD-1234
+                activePairingCode = code?.match(/.{1,4}/g)?.join('-') || code;
+
+                console.log(`\n========================================`);
+                console.log(`🔑 YOUR PAIRING CODE: ${activePairingCode}`);
+                console.log(`========================================\n`);
+            } catch (err) {
+                console.error('❌ Failed to request pairing code:', err.message);
+            }
+        }, 4000); // 4-second delay allows socket initialization before code generation
+    }
 }
 
 connectToWhatsApp();
@@ -127,9 +144,33 @@ app.get('/health', (req, res) => {
     res.status(200).json({
         success: true,
         status: isConnected ? 'ONLINE' : 'DISCONNECTED',
+        pairingCodeAvailable: Boolean(activePairingCode),
         queueLength: sendQueue.length,
         session: SESSION_FOLDER,
         timestamp: new Date().toISOString()
+    });
+});
+
+// Endpoint to view the Pairing Code in a browser or API
+app.get('/pairing-code', (req, res) => {
+    if (sock && sock.user) {
+        return res.status(200).json({
+            success: true,
+            message: 'WhatsApp is already authenticated and connected!'
+        });
+    }
+
+    if (!activePairingCode) {
+        return res.status(404).json({
+            success: false,
+            message: 'Pairing code not available. Ensure PAIRING_NUMBER environment variable is set.'
+        });
+    }
+
+    return res.status(200).json({
+        success: true,
+        pairingCode: activePairingCode,
+        instructions: 'Open WhatsApp -> Settings -> Linked Devices -> Link with phone number instead'
     });
 });
 
